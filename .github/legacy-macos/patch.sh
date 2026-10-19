@@ -14,6 +14,14 @@ grep -q "MACOSX_DEPLOYMENT_TARGET=$MIN" packaging/macos/package.sh
 perl -0pi -e "s#(<key>LSMinimumSystemVersion</key>\s*<string>)[^<]*(</string>)#\${1}$MIN\${2}#" packaging/macos/Info.plist.in
 grep -A1 LSMinimumSystemVersion packaging/macos/Info.plist.in | grep -q "$MIN"
 
+# 1b. The fork's own version (see fork_version.sh), so the launcher offers the fork's own fixes
+# and features as updates. Unset or equal to upstream's: nothing changes.
+if [ -n "${LEGACY_VERSION:-}" ] && ! grep -q "^version = \"$LEGACY_VERSION\"" Cargo.toml; then
+  perl -0pi -e "s#(\[workspace\.package\]\nversion = )\"[^\"]*\"#\${1}\"$LEGACY_VERSION\"#" Cargo.toml
+  grep -q "^version = \"$LEGACY_VERSION\"" Cargo.toml
+  cargo metadata --format-version 1 >/dev/null # records the new version in Cargo.lock
+fi
+
 # 2. The launcher installs and updates from the forks, never from the official 11.0+ builds.
 if [ -f crates/core/src/catalog.rs ] && grep -q 'LAUNCHER_REPO' crates/core/src/catalog.rs; then
   perl -pi -e "s#\"storytold/#\"$OWNER/#g; s#(GITHUB_OWNER: &str = )\"storytold\"#\${1}\"$OWNER\"#" crates/core/src/catalog.rs
@@ -30,12 +38,6 @@ if [ -f crates/core/src/catalog.rs ] && grep -q 'LAUNCHER_REPO' crates/core/src/
   # signature; the download is still checked against the release's SHA-256 digest.
   perl -pi -e 's#Self \{ team: Some\(TEAM_ID\), version: release\.version\.as_ref\(\) \}#Self { team: None, version: release.version.as_ref() }#' crates/native/src/install.rs
   grep -q 'Self { team: None, version: release.version.as_ref() }' crates/native/src/install.rs
-  # The fork's own version (see fork_version.sh), so the launcher's self-update sees the fork's fixes.
-  if [ -n "${LEGACY_VERSION:-}" ]; then
-    perl -0pi -e "s#(\[workspace\.package\]\nversion = )\"[^\"]*\"#\${1}\"$LEGACY_VERSION\"#" Cargo.toml
-    grep -q "^version = \"$LEGACY_VERSION\"" Cargo.toml
-    cargo metadata --format-version 1 >/dev/null # records the new version in Cargo.lock
-  fi
 fi
 # 2b. HTTPS: the OS certificate verifier needs SecTrustEvaluateWithError (10.14+) and Sierra's root
 # store is years out of date, so verify against the bundled Mozilla roots (webpki-roots) instead.
