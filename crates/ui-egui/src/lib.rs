@@ -91,6 +91,9 @@ pub struct UiState {
     /// Tools the user took out of the Tool Sets palette (command ids); each category's gear
     /// menu puts them back.
     pub hidden_tools: Vec<String>,
+    /// For Tool Sets buttons with a drop-down of methods (Arc, Circle): the method last picked,
+    /// as (tool command id, method command id). The button runs that method until another is picked.
+    pub flyout_choice: Vec<(String, String)>,
     pub properties_all: bool,
     /// Show an in-window menu bar (platforms without a native menu bar, or on request).
     pub in_window_menu: bool,
@@ -170,6 +173,7 @@ impl Default for UiState {
             toolset_tab: "Drafting".into(),
             collapsed_groups: Vec::new(),
             hidden_tools: Vec::new(),
+            flyout_choice: Vec::new(),
             properties_all: true,
             in_window_menu: !cfg!(target_os = "macos"),
             start_tab: false,

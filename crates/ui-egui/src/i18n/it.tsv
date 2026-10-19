@@ -76,6 +76,7 @@ menu	Modify	Edita
 	Apply true color	Applica colore reale
 	Arc	Arco
 	Arc Length	Lunghezza arco
+	Arc methods	Metodi arco
 	Area	Area
 	Arrange Panel	Disponi pannello
 	Array	Serie
@@ -136,6 +137,7 @@ menu	Modify	Edita
 	Change to Current Layer	Cambia al layer corrente
 	Changed: {n}	Modificati: {n}
 	Circle	Cerchio
+	Circle methods	Metodi cerchio
 	Circumference	Circonferenza
 	Clear History	Cancella cronologia
 	Clear	Cancella

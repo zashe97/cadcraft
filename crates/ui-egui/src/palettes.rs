@@ -135,6 +135,98 @@ pub const DRAFTING: &[(&str, &[Tool], &[Tool])] = &[
     ),
 ];
 
+/// Tools that run in more than one way, each with its methods (command id, label). The button
+/// runs the method picked last (the first by default); the small triangle in its corner lists them
+/// all, like the Arc and Circle drop-downs of the Draw panel.
+pub const FLYOUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "arc",
+        &[
+            ("arc", "3 Points"),
+            ("arc.sce", "Start, Center, End"),
+            ("arc.sca", "Start, Center, Angle"),
+            ("arc.scl", "Start, Center, Length"),
+            ("arc.sea", "Start, End, Angle"),
+            ("arc.sed", "Start, End, Direction"),
+            ("arc.ser", "Start, End, Radius"),
+            ("arc.cse", "Center, Start, End"),
+            ("arc.csa", "Center, Start, Angle"),
+            ("arc.csl", "Center, Start, Length"),
+            ("arc.continue", "Continue"),
+        ],
+    ),
+    (
+        "circle",
+        &[
+            ("circle", "Center, Radius"),
+            ("circle.cd", "Center, Diameter"),
+            ("circle.2p", "2 Points"),
+            ("circle.3p", "3 Points"),
+            ("circle.ttr", "Tan, Tan, Radius"),
+            ("circle.ttt", "Tan, Tan, Tan"),
+        ],
+    ),
+];
+
+/// The methods of `cmd` when its button has a drop-down.
+pub fn flyout(cmd: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    FLYOUTS.iter().find(|(tool, _)| *tool == cmd).map(|(_, methods)| *methods)
+}
+
+/// The method `cmd`'s button runs now: the one picked last, else the tool's own command.
+fn flyout_current(choices: &[(String, String)], cmd: &'static str) -> (&'static str, Option<&'static str>) {
+    let Some(methods) = flyout(cmd) else { return (cmd, None) };
+    let picked = choices.iter().find(|(tool, _)| tool == cmd).map(|(_, m)| m.as_str());
+    let found = picked.and_then(|p| methods.iter().find(|(m, _)| *m == p)).or_else(|| methods.first());
+    match found {
+        Some((m, label)) => (m, Some(label)),
+        None => (cmd, None),
+    }
+}
+
+/// A Tool Sets button; for a tool with methods, also the triangle that lists them. Returns the
+/// command to start, and the method picked from the list (to remember) if that is how it was chosen.
+fn tool_button(
+    ui: &mut egui::Ui,
+    choices: &[(String, String)],
+    icon: Icon,
+    cmd: &'static str,
+    tip: &str,
+    size: f32,
+) -> (Option<&'static str>, Option<(&'static str, &'static str)>) {
+    let (current, method) = flyout_current(choices, cmd);
+    let label = match method {
+        Some(m) if current != cmd => format!("{} ({})", crate::i18n::t(tip), crate::i18n::t(m)),
+        _ => crate::i18n::t(tip).to_string(),
+    };
+    let resp = ui.add_enabled_ui(command_known(current), |ui| icons::button(ui, icon, size, &label, false)).inner;
+    let mut run = resp.clicked().then_some(current);
+    let mut picked = None;
+    if let Some(methods) = flyout(cmd) {
+        let t = Tokens::get();
+        let side = (size * 0.38).max(9.0);
+        let tri = Rect::from_min_size(resp.rect.max - vec2(side, side), vec2(side, side));
+        let tresp = ui.interact(tri, ui.id().with(("ts_flyout", cmd)), Sense::click());
+        let c = tri.shrink(side * 0.22);
+        let color = if tresp.hovered() { t.text } else { t.text_dim };
+        ui.painter().add(egui::Shape::convex_polygon(vec![c.right_top(), c.right_bottom(), c.left_bottom()], color, Stroke::NONE));
+        let more = crate::i18n::t(&format!("{tip} methods")).to_string();
+        icons::describe_control(ui, &tresp, &more, None, false);
+        let tresp = tresp.on_hover_text(&more);
+        egui::Popup::from_toggle_button_response(&tresp).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
+            for (m, mlabel) in methods.iter() {
+                let resp = ui.add_enabled(command_known(m), egui::Button::selectable(*m == current, crate::i18n::t(mlabel)));
+                crate::control::record_widget(ui, &resp, mlabel, "button", Some(*m == current));
+                if resp.clicked() {
+                    run = Some(m);
+                    picked = Some((cmd, *m));
+                }
+            }
+        });
+    }
+    (run, picked)
+}
+
 fn command_known(id: &str) -> bool {
     cadcraft_engine::find_command(id).is_some() || crate::menus::is_ui_command(id)
 }
@@ -176,6 +268,7 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         let body = Rect::from_min_max(pos2(r.left(), r.top() + tab_h), r.max);
         let mut clicked: Option<&'static str> = None;
+        let mut picked: Option<(&'static str, &'static str)> = None;
         let mut toggle_group = None;
         let mut tool_visible: Option<(String, bool)> = None;
         let mut restore: Vec<String> = Vec::new();
@@ -234,11 +327,9 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                                     if hidden(cmd) {
                                         continue;
                                     }
-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
-                                        if icons::button(ui, *icon, 40.0, tip, false).clicked() {
-                                            clicked = Some(cmd);
-                                        }
-                                    });
+                                    let (run, pick) = tool_button(ui, &app.ui.flyout_choice, *icon, cmd, tip, 40.0);
+                                    clicked = clicked.or(run);
+                                    picked = picked.or(pick);
                                 }
                             });
                         }
@@ -250,11 +341,9 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
                                 ui.add_space(8.0);
                                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
                                 for (icon, cmd, tip) in row.iter() {
-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
-                                        if icons::button(ui, *icon, 23.0, tip, false).clicked() {
-                                            clicked = Some(cmd);
-                                        }
-                                    });
+                                    let (run, pick) = tool_button(ui, &app.ui.flyout_choice, *icon, cmd, tip, 23.0);
+                                    clicked = clicked.or(run);
+                                    picked = picked.or(pick);
                                 }
                             });
                         }
@@ -281,6 +370,10 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
             } else {
                 app.ui.collapsed_groups.push(g);
             }
+        }
+        if let Some((tool, method)) = picked {
+            app.ui.flyout_choice.retain(|(t, _)| t != tool);
+            app.ui.flyout_choice.push((tool.to_string(), method.to_string()));
         }
         if let Some(c) = clicked {
             app.cmd.buffer.clear();
