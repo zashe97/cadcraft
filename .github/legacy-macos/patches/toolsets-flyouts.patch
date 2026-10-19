@@ -1,0 +1,247 @@
+diff --git a/crates/ui-egui/src/i18n/it.tsv b/crates/ui-egui/src/i18n/it.tsv
+index c7a0941..cbf31cf 100644
+--- a/crates/ui-egui/src/i18n/it.tsv
++++ b/crates/ui-egui/src/i18n/it.tsv
+@@ -76,6 +76,7 @@ menu	Modify	Edita
+ 	Apply true color	Applica colore reale
+ 	Arc	Arco
+ 	Arc Length	Lunghezza arco
++	Arc methods	Metodi arco
+ 	Area	Area
+ 	Arrange Panel	Disponi pannello
+ 	Array	Serie
+@@ -136,6 +137,7 @@ menu	Modify	Edita
+ 	Change to Current Layer	Cambia al layer corrente
+ 	Changed: {n}	Modificati: {n}
+ 	Circle	Cerchio
++	Circle methods	Metodi cerchio
+ 	Circumference	Circonferenza
+ 	Clear History	Cancella cronologia
+ 	Clear	Cancella
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 9f3204b..f409645 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -91,6 +91,9 @@ pub struct UiState {
+     /// Tools the user took out of the Tool Sets palette (command ids); each category's gear
+     /// menu puts them back.
+     pub hidden_tools: Vec<String>,
++    /// For Tool Sets buttons with a drop-down of methods (Arc, Circle): the method last picked,
++    /// as (tool command id, method command id). The button runs that method until another is picked.
++    pub flyout_choice: Vec<(String, String)>,
+     pub properties_all: bool,
+     /// Show an in-window menu bar (platforms without a native menu bar, or on request).
+     pub in_window_menu: bool,
+@@ -170,6 +173,7 @@ impl Default for UiState {
+             toolset_tab: "Drafting".into(),
+             collapsed_groups: Vec::new(),
+             hidden_tools: Vec::new(),
++            flyout_choice: Vec::new(),
+             properties_all: true,
+             in_window_menu: !cfg!(target_os = "macos"),
+             start_tab: false,
+diff --git a/crates/ui-egui/src/palettes.rs b/crates/ui-egui/src/palettes.rs
+index 29bedf6..8ca74c2 100644
+--- a/crates/ui-egui/src/palettes.rs
++++ b/crates/ui-egui/src/palettes.rs
+@@ -135,6 +135,98 @@ pub const DRAFTING: &[(&str, &[Tool], &[Tool])] = &[
+     ),
+ ];
+ 
++/// Tools that run in more than one way, each with its methods (command id, label). The button
++/// runs the method picked last (the first by default); the small triangle in its corner lists them
++/// all, like the Arc and Circle drop-downs of the Draw panel.
++pub const FLYOUTS: &[(&str, &[(&str, &str)])] = &[
++    (
++        "arc",
++        &[
++            ("arc", "3 Points"),
++            ("arc.sce", "Start, Center, End"),
++            ("arc.sca", "Start, Center, Angle"),
++            ("arc.scl", "Start, Center, Length"),
++            ("arc.sea", "Start, End, Angle"),
++            ("arc.sed", "Start, End, Direction"),
++            ("arc.ser", "Start, End, Radius"),
++            ("arc.cse", "Center, Start, End"),
++            ("arc.csa", "Center, Start, Angle"),
++            ("arc.csl", "Center, Start, Length"),
++            ("arc.continue", "Continue"),
++        ],
++    ),
++    (
++        "circle",
++        &[
++            ("circle", "Center, Radius"),
++            ("circle.cd", "Center, Diameter"),
++            ("circle.2p", "2 Points"),
++            ("circle.3p", "3 Points"),
++            ("circle.ttr", "Tan, Tan, Radius"),
++            ("circle.ttt", "Tan, Tan, Tan"),
++        ],
++    ),
++];
++
++/// The methods of `cmd` when its button has a drop-down.
++pub fn flyout(cmd: &str) -> Option<&'static [(&'static str, &'static str)]> {
++    FLYOUTS.iter().find(|(tool, _)| *tool == cmd).map(|(_, methods)| *methods)
++}
++
++/// The method `cmd`'s button runs now: the one picked last, else the tool's own command.
++fn flyout_current(choices: &[(String, String)], cmd: &'static str) -> (&'static str, Option<&'static str>) {
++    let Some(methods) = flyout(cmd) else { return (cmd, None) };
++    let picked = choices.iter().find(|(tool, _)| tool == cmd).map(|(_, m)| m.as_str());
++    let found = picked.and_then(|p| methods.iter().find(|(m, _)| *m == p)).or_else(|| methods.first());
++    match found {
++        Some((m, label)) => (m, Some(label)),
++        None => (cmd, None),
++    }
++}
++
++/// A Tool Sets button; for a tool with methods, also the triangle that lists them. Returns the
++/// command to start, and the method picked from the list (to remember) if that is how it was chosen.
++fn tool_button(
++    ui: &mut egui::Ui,
++    choices: &[(String, String)],
++    icon: Icon,
++    cmd: &'static str,
++    tip: &str,
++    size: f32,
++) -> (Option<&'static str>, Option<(&'static str, &'static str)>) {
++    let (current, method) = flyout_current(choices, cmd);
++    let label = match method {
++        Some(m) if current != cmd => format!("{} ({})", crate::i18n::t(tip), crate::i18n::t(m)),
++        _ => crate::i18n::t(tip).to_string(),
++    };
++    let resp = ui.add_enabled_ui(command_known(current), |ui| icons::button(ui, icon, size, &label, false)).inner;
++    let mut run = resp.clicked().then_some(current);
++    let mut picked = None;
++    if let Some(methods) = flyout(cmd) {
++        let t = Tokens::get();
++        let side = (size * 0.38).max(9.0);
++        let tri = Rect::from_min_size(resp.rect.max - vec2(side, side), vec2(side, side));
++        let tresp = ui.interact(tri, ui.id().with(("ts_flyout", cmd)), Sense::click());
++        let c = tri.shrink(side * 0.22);
++        let color = if tresp.hovered() { t.text } else { t.text_dim };
++        ui.painter().add(egui::Shape::convex_polygon(vec![c.right_top(), c.right_bottom(), c.left_bottom()], color, Stroke::NONE));
++        let more = crate::i18n::t(&format!("{tip} methods")).to_string();
++        icons::describe_control(ui, &tresp, &more, None, false);
++        let tresp = tresp.on_hover_text(&more);
++        egui::Popup::from_toggle_button_response(&tresp).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
++            for (m, mlabel) in methods.iter() {
++                let resp = ui.add_enabled(command_known(m), egui::Button::selectable(*m == current, crate::i18n::t(mlabel)));
++                crate::control::record_widget(ui, &resp, mlabel, "button", Some(*m == current));
++                if resp.clicked() {
++                    run = Some(m);
++                    picked = Some((cmd, *m));
++                }
++            }
++        });
++    }
++    (run, picked)
++}
++
+ fn command_known(id: &str) -> bool {
+     cadcraft_engine::find_command(id).is_some() || crate::menus::is_ui_command(id)
+ }
+@@ -176,6 +268,7 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
+         }
+         let body = Rect::from_min_max(pos2(r.left(), r.top() + tab_h), r.max);
+         let mut clicked: Option<&'static str> = None;
++        let mut picked: Option<(&'static str, &'static str)> = None;
+         let mut toggle_group = None;
+         let mut tool_visible: Option<(String, bool)> = None;
+         let mut restore: Vec<String> = Vec::new();
+@@ -234,11 +327,9 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
+                                     if hidden(cmd) {
+                                         continue;
+                                     }
+-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
+-                                        if icons::button(ui, *icon, 40.0, tip, false).clicked() {
+-                                            clicked = Some(cmd);
+-                                        }
+-                                    });
++                                    let (run, pick) = tool_button(ui, &app.ui.flyout_choice, *icon, cmd, tip, 40.0);
++                                    clicked = clicked.or(run);
++                                    picked = picked.or(pick);
+                                 }
+                             });
+                         }
+@@ -250,11 +341,9 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
+                                 ui.add_space(8.0);
+                                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+                                 for (icon, cmd, tip) in row.iter() {
+-                                    ui.add_enabled_ui(command_known(cmd), |ui| {
+-                                        if icons::button(ui, *icon, 23.0, tip, false).clicked() {
+-                                            clicked = Some(cmd);
+-                                        }
+-                                    });
++                                    let (run, pick) = tool_button(ui, &app.ui.flyout_choice, *icon, cmd, tip, 23.0);
++                                    clicked = clicked.or(run);
++                                    picked = picked.or(pick);
+                                 }
+                             });
+                         }
+@@ -282,6 +371,10 @@ pub fn toolsets(app: &mut CadApp, ui: &mut egui::Ui) {
+                 app.ui.collapsed_groups.push(g);
+             }
+         }
++        if let Some((tool, method)) = picked {
++            app.ui.flyout_choice.retain(|(t, _)| t != tool);
++            app.ui.flyout_choice.push((tool.to_string(), method.to_string()));
++        }
+         if let Some(c) = clicked {
+             app.cmd.buffer.clear();
+             app.start(c);
+diff --git a/crates/ui-egui/tests/toolsets_flyouts.rs b/crates/ui-egui/tests/toolsets_flyouts.rs
+new file mode 100644
+index 0000000..73161f7
+--- /dev/null
++++ b/crates/ui-egui/tests/toolsets_flyouts.rs
+@@ -0,0 +1,47 @@
++//! Tool Sets buttons with several methods (Arc, Circle): the small triangle lists them, picking
++//! one starts it, and the button then runs the method picked last.
++
++use cadcraft_engine::Session;
++use cadcraft_ui_egui::palettes::FLYOUTS;
++use cadcraft_ui_egui::{CadApp, Services};
++use egui::vec2;
++use egui_kittest::Harness;
++use egui_kittest::kittest::Queryable;
++
++fn harness() -> Harness<'static, CadApp> {
++    let mut app = CadApp::new(Session::default(), Services::default());
++    app.ui.in_window_menu = false;
++    app.integrated_titlebar = true;
++    let mut harness = Harness::builder().with_size(vec2(1280.0, 760.0)).build_ui_state(
++        |ui, app: &mut CadApp| {
++            app.logic(&ui.ctx().clone());
++            app.ui(ui);
++        },
++        app,
++    );
++    harness.run_steps(5);
++    harness
++}
++
++#[test]
++fn every_method_is_a_command() {
++    for (tool, methods) in FLYOUTS {
++        assert!(cadcraft_engine::find_command(tool).is_some(), "{tool}");
++        assert_eq!(methods.first().map(|(m, _)| *m), Some(*tool), "{tool}: the first method is the tool's own command");
++        for (m, _) in methods.iter() {
++            assert!(cadcraft_engine::find_command(m).is_some(), "{tool}: {m} is not a command");
++        }
++    }
++}
++
++#[test]
++fn the_triangle_lists_the_arc_methods_and_the_button_remembers_the_pick() {
++    let mut harness = harness();
++    assert!(harness.state().ui.flyout_choice.is_empty());
++    harness.get_by_label("Arc methods").click();
++    harness.run_steps(5);
++    harness.get_by_label("Start, Center, End").click();
++    harness.run_steps(5);
++    assert_eq!(harness.state().ui.flyout_choice, vec![("arc".to_string(), "arc.sce".to_string())], "the pick is remembered");
++    assert!(harness.query_by_label("Arc (Start, Center, End)").is_some(), "the button now names the method it runs");
++}
