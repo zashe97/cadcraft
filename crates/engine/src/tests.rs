@@ -478,6 +478,21 @@ fn layers_and_properties() {
 }
 
 #[test]
+fn new_layer_inherits_from_the_selected_layer() {
+    let mut s = Session::new();
+    s.execute("layer.new", &json!({"name": "Walls", "color": "red", "linetype": "Continuous", "lineweight": 0.5})).unwrap();
+    s.execute("layer.set", &json!({"name": "Walls", "description": "Outer walls", "plot": false})).unwrap();
+    s.execute("layer.new", &json!({"name": "Layer1", "from": "Walls"})).unwrap();
+    let d = s.doc().unwrap();
+    let (w, l) = (d.layer("Walls").unwrap(), d.layer("Layer1").unwrap());
+    assert_eq!(l.color, w.color);
+    assert_eq!(l.lineweight, w.lineweight);
+    assert!(!l.plot);
+    assert_eq!(l.description, "");
+    assert!(s.execute("layer.new", &json!({"name": "Layer2", "from": "Nope"})).is_err());
+}
+
+#[test]
 fn properties_set_transparency() {
     use cadcraft_doc::Transparency;
     // Issue #132: `properties.set` used to ignore `transparency`.

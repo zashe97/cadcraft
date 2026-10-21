@@ -258,12 +258,9 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
             // ----- tool row -----
             ui.horizontal(|ui| {
                 if icons::button(ui, Icon::Plus, 24.0, "New Layer", false).clicked() {
-                    let mut n = 1;
-                    while d.layer(&format!("Layer{n}")).is_some() {
-                        n += 1;
-                    }
-                    let name = format!("Layer{n}");
-                    actions.push(("layer.new", json!({ "name": name })));
+                    let name = next_layer_name(d);
+                    let from = st.selected.clone().filter(|s| d.layer(s).is_some()).unwrap_or_else(|| cur.clone());
+                    actions.push(("layer.new", json!({ "name": name, "from": from })));
                     st.renaming = Some((name.clone(), name.clone()));
                     st.selected = Some(name);
                 }
@@ -677,6 +674,11 @@ fn row(
 }
 
 /// Lower-case names of layers with objects on them.
+/// The first free `LayerN` name, the name AutoCAD gives a new layer.
+pub(crate) fn next_layer_name(d: &cadcraft_doc::Drawing) -> String {
+    (1..).map(|n| format!("Layer{n}")).find(|n| d.layer(n).is_none()).unwrap()
+}
+
 fn used_layers(d: &cadcraft_doc::Drawing) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     let ents = d.model.iter().chain(d.layouts.iter().flat_map(|l| l.entities.iter())).chain(d.blocks.values().flat_map(|b| b.entities.iter()));

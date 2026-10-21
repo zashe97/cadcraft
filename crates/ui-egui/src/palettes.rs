@@ -408,6 +408,11 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let cur = d.header.str("CLAYER", "0");
     let layers: Vec<(String, bool, bool, bool, Color)> = d.layers.iter().map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color)).collect();
     let cur_info = layers.iter().find(|l| l.0.eq_ignore_ascii_case(&cur)).cloned();
+    let next_name = crate::layers::next_layer_name(d);
+    // (layer, buffer) while a layer in the list is being renamed.
+    let rename_id = egui::Id::new("layers_palette_rename");
+    let mut renaming: Option<(String, String)> = ui.data(|d| d.get_temp(rename_id));
+    let mut rename: Option<(String, String)> = None;
     let mut set_current = None;
     let mut toggle: Option<(String, &str, bool)> = None;
     ui.horizontal(|ui| {
@@ -498,6 +503,21 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
                 let (sr, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
                 swatch(ui.painter(), sr, *color);
+                // A new layer's name is editable straight away, as in AutoCAD's Layers palette.
+                if let Some((n, buf)) = renaming.as_mut().filter(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                    let r = ui.add(egui::TextEdit::singleline(buf).desired_width(ui.available_width() - 10.0).id(rename_id.with(&*n)));
+                    if !r.has_focus() && !r.lost_focus() {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() {
+                        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if !cancel && !buf.trim().is_empty() && buf.trim() != n.as_str() {
+                            rename = Some((n.clone(), buf.trim().to_string()));
+                        }
+                        renaming = None;
+                    }
+                    return;
+                }
                 let r = ui.selectable_label(name.eq_ignore_ascii_case(&cur), name);
                 if r.clicked() {
                     set_current = Some(name.clone());
@@ -505,6 +525,25 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
             });
         }
+    }
+    // Lower toolbar: New Layer, named LayerN and inheriting the current layer's properties.
+    let mut new_layer = false;
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        new_layer = icons::button(ui, Icon::Plus, 22.0, "New Layer", false).clicked();
+    });
+    if new_layer && app.run("layer.new", json!({ "name": next_name, "from": cur })).is_ok() {
+        app.ui.show_layer_list = true;
+        renaming = Some((next_name.clone(), next_name));
+    }
+    ui.data_mut(|d| match &renaming {
+        Some(r) => {
+            d.insert_temp(rename_id, r.clone());
+        }
+        None => d.remove::<(String, String)>(rename_id),
+    });
+    if let Some((n, nn)) = rename {
+        let _ = app.run("layer.set", json!({ "name": n, "newName": nn }));
     }
     if let Some(n) = set_current {
         let _ = app.run("layer.current", json!({ "name": n }));

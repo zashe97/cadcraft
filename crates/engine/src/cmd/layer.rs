@@ -17,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .alias(&["la", "layers", "-layer"])
             .params("{} → layers, states (typed -LAYER: option prompts)")
             .interactive(|_| Ok(Box::new(prompts::LayerM::default()))),
-        CommandSpec::new("layer.new", "New Layer", run_new).params("{name, color?, linetype?, lineweight? (mm), current?: bool}"),
+        CommandSpec::new("layer.new", "New Layer", run_new).params("{name, from? (layer to copy properties from), color?, linetype?, lineweight? (mm), current?: bool}"),
         CommandSpec::new("layer.set", "Set Layer Properties", run_set)
             .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newVpFreeze?, plotStyle? (named plot style), newName?}"),
         CommandSpec::new("layer.current", "Make Current", run_current)
@@ -194,7 +194,15 @@ fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("layer.new", format!("layer `{name}` already exists")));
     }
     let lt = loaded_linetype(d, "layer.new", p)?;
-    let mut l = Layer::new(&name);
+    // A new layer inherits the properties of the layer selected when it is created (AutoCAD's
+    // Layer Properties Manager and Layers palette); the description stays the source's own.
+    let mut l = match str_param(p, "from") {
+        Some(src) => {
+            let src = d.layer(src).ok_or_else(|| bad("layer.new", format!("no layer `{src}`")))?;
+            Layer { name: name.clone(), description: String::new(), ..src.clone() }
+        }
+        None => Layer::new(&name),
+    };
     apply(&mut l, p)?;
     if let Some(lt) = lt {
         l.linetype = lt;
