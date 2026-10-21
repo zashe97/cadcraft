@@ -1,0 +1,215 @@
+diff --git a/crates/engine/src/cmd/layer.rs b/crates/engine/src/cmd/layer.rs
+index 4f0a586..b2544e2 100644
+--- a/crates/engine/src/cmd/layer.rs
++++ b/crates/engine/src/cmd/layer.rs
+@@ -17,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
+             .alias(&["la", "layers", "-layer"])
+             .params("{} → layers, states (typed -LAYER: option prompts)")
+             .interactive(|_| Ok(Box::new(prompts::LayerM::default()))),
+-        CommandSpec::new("layer.new", "New Layer", run_new).params("{name, color?, linetype?, lineweight? (mm), current?: bool}"),
++        CommandSpec::new("layer.new", "New Layer", run_new).params("{name, from? (layer to copy properties from), color?, linetype?, lineweight? (mm), current?: bool}"),
+         CommandSpec::new("layer.set", "Set Layer Properties", run_set)
+             .params("{name, on?, frozen?, locked?, plot?, color?, linetype?, lineweight?, transparency?, description?, newVpFreeze?, plotStyle? (named plot style), newName?}"),
+         CommandSpec::new("layer.current", "Make Current", run_current)
+@@ -194,7 +194,15 @@ fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
+         return Err(bad("layer.new", format!("layer `{name}` already exists")));
+     }
+     let lt = loaded_linetype(d, "layer.new", p)?;
+-    let mut l = Layer::new(&name);
++    // A new layer inherits the properties of the layer selected when it is created (AutoCAD's
++    // Layer Properties Manager and Layers palette); the description stays the source's own.
++    let mut l = match str_param(p, "from") {
++        Some(src) => {
++            let src = d.layer(src).ok_or_else(|| bad("layer.new", format!("no layer `{src}`")))?;
++            Layer { name: name.clone(), description: String::new(), ..src.clone() }
++        }
++        None => Layer::new(&name),
++    };
+     apply(&mut l, p)?;
+     if let Some(lt) = lt {
+         l.linetype = lt;
+diff --git a/crates/engine/src/tests.rs b/crates/engine/src/tests.rs
+index f205c2e..8524442 100644
+--- a/crates/engine/src/tests.rs
++++ b/crates/engine/src/tests.rs
+@@ -477,6 +477,21 @@ fn layers_and_properties() {
+     assert!(s.execute("layer.new", &json!({"name": "bad/name"})).is_err());
+ }
+ 
++#[test]
++fn new_layer_inherits_from_the_selected_layer() {
++    let mut s = Session::new();
++    s.execute("layer.new", &json!({"name": "Walls", "color": "red", "linetype": "Continuous", "lineweight": 0.5})).unwrap();
++    s.execute("layer.set", &json!({"name": "Walls", "description": "Outer walls", "plot": false})).unwrap();
++    s.execute("layer.new", &json!({"name": "Layer1", "from": "Walls"})).unwrap();
++    let d = s.doc().unwrap();
++    let (w, l) = (d.layer("Walls").unwrap(), d.layer("Layer1").unwrap());
++    assert_eq!(l.color, w.color);
++    assert_eq!(l.lineweight, w.lineweight);
++    assert!(!l.plot);
++    assert_eq!(l.description, "");
++    assert!(s.execute("layer.new", &json!({"name": "Layer2", "from": "Nope"})).is_err());
++}
++
+ #[test]
+ fn properties_set_transparency() {
+     use cadcraft_doc::Transparency;
+diff --git a/crates/ui-egui/src/layers.rs b/crates/ui-egui/src/layers.rs
+index 6cadfea..be3edd5 100644
+--- a/crates/ui-egui/src/layers.rs
++++ b/crates/ui-egui/src/layers.rs
+@@ -258,12 +258,9 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
+             // ----- tool row -----
+             ui.horizontal(|ui| {
+                 if icons::button(ui, Icon::Plus, 24.0, "New Layer", false).clicked() {
+-                    let mut n = 1;
+-                    while d.layer(&format!("Layer{n}")).is_some() {
+-                        n += 1;
+-                    }
+-                    let name = format!("Layer{n}");
+-                    actions.push(("layer.new", json!({ "name": name })));
++                    let name = next_layer_name(d);
++                    let from = st.selected.clone().filter(|s| d.layer(s).is_some()).unwrap_or_else(|| cur.clone());
++                    actions.push(("layer.new", json!({ "name": name, "from": from })));
+                     st.renaming = Some((name.clone(), name.clone()));
+                     st.selected = Some(name);
+                 }
+@@ -677,6 +674,11 @@ fn row(
+ }
+ 
+ /// Lower-case names of layers with objects on them.
++/// The first free `LayerN` name, the name AutoCAD gives a new layer.
++pub(crate) fn next_layer_name(d: &cadcraft_doc::Drawing) -> String {
++    (1..).map(|n| format!("Layer{n}")).find(|n| d.layer(n).is_none()).unwrap()
++}
++
+ fn used_layers(d: &cadcraft_doc::Drawing) -> std::collections::HashSet<String> {
+     let mut set = std::collections::HashSet::new();
+     let ents = d.model.iter().chain(d.layouts.iter().flat_map(|l| l.entities.iter())).chain(d.blocks.values().flat_map(|b| b.entities.iter()));
+diff --git a/crates/ui-egui/src/palettes.rs b/crates/ui-egui/src/palettes.rs
+index 29bedf6..a020e66 100644
+--- a/crates/ui-egui/src/palettes.rs
++++ b/crates/ui-egui/src/palettes.rs
+@@ -408,6 +408,11 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
+     let cur = d.header.str("CLAYER", "0");
+     let layers: Vec<(String, bool, bool, bool, Color)> = d.layers.iter().map(|l| (l.name.clone(), l.on, l.frozen, l.locked, l.color)).collect();
+     let cur_info = layers.iter().find(|l| l.0.eq_ignore_ascii_case(&cur)).cloned();
++    let next_name = crate::layers::next_layer_name(d);
++    // (layer, buffer) while a layer in the list is being renamed.
++    let rename_id = egui::Id::new("layers_palette_rename");
++    let mut renaming: Option<(String, String)> = ui.data(|d| d.get_temp(rename_id));
++    let mut rename: Option<(String, String)> = None;
+     let mut set_current = None;
+     let mut toggle: Option<(String, &str, bool)> = None;
+     ui.horizontal(|ui| {
+@@ -498,6 +503,21 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
+                 }
+                 let (sr, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+                 swatch(ui.painter(), sr, *color);
++                // A new layer's name is editable straight away, as in AutoCAD's Layers palette.
++                if let Some((n, buf)) = renaming.as_mut().filter(|(n, _)| n.eq_ignore_ascii_case(name)) {
++                    let r = ui.add(egui::TextEdit::singleline(buf).desired_width(ui.available_width() - 10.0).id(rename_id.with(&*n)));
++                    if !r.has_focus() && !r.lost_focus() {
++                        r.request_focus();
++                    }
++                    if r.lost_focus() {
++                        let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
++                        if !cancel && !buf.trim().is_empty() && buf.trim() != n.as_str() {
++                            rename = Some((n.clone(), buf.trim().to_string()));
++                        }
++                        renaming = None;
++                    }
++                    return;
++                }
+                 let r = ui.selectable_label(name.eq_ignore_ascii_case(&cur), name);
+                 if r.clicked() {
+                     set_current = Some(name.clone());
+@@ -506,6 +526,25 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
+             });
+         }
+     }
++    // Lower toolbar: New Layer, named LayerN and inheriting the current layer's properties.
++    let mut new_layer = false;
++    ui.horizontal(|ui| {
++        ui.add_space(8.0);
++        new_layer = icons::button(ui, Icon::Plus, 22.0, "New Layer", false).clicked();
++    });
++    if new_layer && app.run("layer.new", json!({ "name": next_name, "from": cur })).is_ok() {
++        app.ui.show_layer_list = true;
++        renaming = Some((next_name.clone(), next_name));
++    }
++    ui.data_mut(|d| match &renaming {
++        Some(r) => {
++            d.insert_temp(rename_id, r.clone());
++        }
++        None => d.remove::<(String, String)>(rename_id),
++    });
++    if let Some((n, nn)) = rename {
++        let _ = app.run("layer.set", json!({ "name": n, "newName": nn }));
++    }
+     if let Some(n) = set_current {
+         let _ = app.run("layer.current", json!({ "name": n }));
+     }
+diff --git a/crates/ui-egui/tests/layers_palette_new_layer.rs b/crates/ui-egui/tests/layers_palette_new_layer.rs
+new file mode 100644
+index 0000000..68d9c4a
+--- /dev/null
++++ b/crates/ui-egui/tests/layers_palette_new_layer.rs
+@@ -0,0 +1,57 @@
++//! The Layers palette's New Layer button (AutoCAD for Mac's lower toolbar): it adds `LayerN`
++//! with the current layer's properties and leaves the name open for typing.
++
++use cadcraft_engine::Session;
++use cadcraft_ui_egui::{CadApp, Services};
++use egui::{Key, vec2};
++use egui_kittest::Harness;
++use egui_kittest::kittest::{Queryable, by};
++use serde_json::json;
++
++fn palettes() -> Harness<'static, CadApp> {
++    let mut app = CadApp::new(Session::default(), Services::default());
++    app.run("layer.new", json!({ "name": "Walls", "color": "red", "current": true })).unwrap();
++    let mut h = Harness::builder().with_size(vec2(400.0, 1400.0)).build_ui_state(
++        |ui, app: &mut CadApp| {
++            app.logic(&ui.ctx().clone());
++            cadcraft_ui_egui::palettes::right_palettes(app, ui);
++        },
++        app,
++    );
++    h.run_steps(4);
++    h
++}
++
++fn layer_names(app: &CadApp) -> Vec<String> {
++    app.session.doc().unwrap().layers.iter().map(|l| l.name.clone()).collect()
++}
++
++#[test]
++fn new_layer_inherits_the_current_layer_and_is_renamed_in_place() {
++    let mut h = palettes();
++    assert!(!h.state().ui.show_layer_list);
++    h.get_by_label("New Layer").click();
++    h.run_steps(3);
++    let app = h.state();
++    assert!(app.ui.show_layer_list, "the list opens to show the new layer");
++    let d = app.session.doc().unwrap();
++    assert_eq!(d.layer("Layer1").unwrap().color, d.layer("Walls").unwrap().color);
++    assert_eq!(d.header.str("CLAYER", "0"), "Walls", "the current layer is unchanged");
++
++    // The name field has focus with the default name in it.
++    h.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
++    h.run_steps(1);
++    h.get(by().role(egui::accesskit::Role::TextInput).value("Layer1")).type_text("Doors");
++    h.run_steps(2);
++    h.key_press(Key::Enter);
++    h.run_steps(3);
++    let names = layer_names(h.state());
++    assert!(names.contains(&"Doors".to_string()) && !names.contains(&"Layer1".to_string()), "{names:?}");
++
++    // A second one takes the next free name; Escape keeps it.
++    h.get_by_label("New Layer").click();
++    h.run_steps(3);
++    h.key_press(Key::Escape);
++    h.run_steps(3);
++    assert!(layer_names(h.state()).contains(&"Layer1".to_string()));
++}

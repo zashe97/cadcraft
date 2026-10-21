@@ -1,0 +1,371 @@
+diff --git a/crates/engine/src/snap.rs b/crates/engine/src/snap.rs
+index 3b38b97..ec294c5 100644
+--- a/crates/engine/src/snap.rs
++++ b/crates/engine/src/snap.rs
+@@ -417,9 +417,13 @@ fn finish(
+     deferred: bool,
+     clip: Option<Bounds2>,
+ ) -> Option<SnapHit> {
+-    // Perpendicular / tangent from the base point.
++    // Perpendicular / tangent from the base point. As in AutoCAD, the object only has to be under
++    // the aperture: when no snap point is near the cursor, the perpendicular foot or tangent point
++    // of the object under it is taken wherever it lies (`along`).
++    let mut along: Vec<(u32, Vec2)> = Vec::new();
+     if let Some(bp) = base {
+         for p in near_prims {
++            let first = cands.len();
+             if osmode & mode::PER != 0 {
+                 match p {
+                     Prim::Seg(Segment::Line(l)) => cands.push((mode::PER, l.project(bp))),
+@@ -441,6 +445,9 @@ fn finish(
+                 };
+                 cands.extend(pts.into_iter().map(|t| (mode::TAN, t)));
+             }
++            if prim_distance(p, cursor) <= aperture {
++                along.extend(cands.get(first..).unwrap_or_default());
++            }
+         }
+     }
+     let visible = |p: Vec2| p.is_finite() && clip.is_none_or(|c| c.contains(p));
+@@ -453,6 +460,9 @@ fn finish(
+     if let Some((m, p)) = best {
+         return Some(SnapHit { point: *p, mode: *m, name: name_of(*m), viewport: None, deferred: None });
+     }
++    if let Some((m, p)) = along.iter().filter(|(_, p)| visible(*p)).min_by(|a, b| a.1.dist(cursor).total_cmp(&b.1.dist(cursor))) {
++        return Some(SnapHit { point: *p, mode: *m, name: name_of(*m), viewport: None, deferred: None });
++    }
+     if base.is_none()
+         && deferred
+         && let Some(h) = deferred_hit(near_prims, cursor, aperture, osmode, clip)
+@@ -483,6 +493,15 @@ fn finish(
+     None
+ }
+ 
++/// The distance from `cursor` to the closest point of `p` (infinite when it has no curve).
++fn prim_distance(p: &Prim, cursor: Vec2) -> f64 {
++    let curve = prim_segments(p).iter().map(|s| fix_circle(s).closest(cursor).dist(cursor)).fold(f64::INFINITY, f64::min);
++    match p {
++        Prim::Circle(c) => curve.min(c.closest(cursor).dist(cursor)),
++        _ => curve,
++    }
++}
++
+ fn snap_score(mode: u32, point: Vec2, cursor: Vec2, aperture: f64) -> f64 {
+     point.dist(cursor) - if mode == mode::INT || mode == mode::END { aperture * 0.15 } else { 0.0 }
+ }
+diff --git a/crates/ui-egui/src/chrome.rs b/crates/ui-egui/src/chrome.rs
+index 032445d..02f8f35 100644
+--- a/crates/ui-egui/src/chrome.rs
++++ b/crates/ui-egui/src/chrome.rs
+@@ -346,7 +346,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
+             (Icon::Gear, false, "ui.dialog.dsettings", "Drafting Settings"),
+         ];
+         let size = 20.0;
+-        let mut rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0);
++        let arrows = toggles.iter().filter(|(_, _, cmd, _)| has_menu(cmd)).count();
++        let mut rx = r.right() - 8.0 - toggles.len() as f32 * (size + 4.0) - arrows as f32 * MENU_ARROW;
+         // Coordinates.
+         let coord = app.canvas.cursor.map(|c| {
+             let (lu, lp) = app.session.doc().map(|d| (d.header.i64("LUNITS", 2), d.header.i64("LUPREC", 4))).unwrap_or((2, 4));
+@@ -490,6 +491,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
+             }
+         }
+         let mut toggle_cmd = None;
++        let mut status_menu = None;
+         for (icon, on, cmd, tip) in toggles {
+             let br = Rect::from_min_size(pos2(rx, r.center().y - size / 2.0), vec2(size, size));
+             let resp = ui.interact(br, ui.id().with(("tg", tip)), Sense::click());
+@@ -504,10 +506,46 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
+                 p.hline(br.x_range().shrink(4.0), br.bottom() - 1.0, Stroke::new(1.5, t.toggle_on));
+             }
+             icons::describe_control(ui, &resp, tip, Some(on), false);
+-            if resp.on_hover_text(crate::i18n::t(tip)).clicked() {
+-                toggle_cmd = Some(cmd);
++            let resp = resp.on_hover_text(crate::i18n::t(tip));
++            if resp.clicked() {
++                // With no running snap chosen, Object Snap opens its settings, as in AutoCAD.
++                let none = cmd == "osnap" && s.osmode & !mode::OFF == 0;
++                toggle_cmd = Some(if none { "ui.dialog.dsettings" } else { cmd });
+             }
+             rx += size + 4.0;
++            // Object Snap and Snap Mode have a menu, as in AutoCAD: the arrow beside the button,
++            // or a right-click on the button itself.
++            if has_menu(cmd) {
++                let ar = Rect::from_min_size(pos2(br.right(), br.top()), vec2(MENU_ARROW, size));
++                let label = if cmd == "osnap" { "Object Snap menu" } else { "Snap Mode menu" };
++                let aresp = ui.interact(ar, ui.id().with(("tgm", tip)), Sense::click());
++                if aresp.hovered() {
++                    p.rect_filled(ar, 2.0, t.control_hover.gamma_multiply(0.5));
++                }
++                icons::paint(&p, Rect::from_center_size(ar.center(), vec2(MENU_ARROW, MENU_ARROW)), Icon::ChevronDown, false);
++                icons::describe_control(ui, &aresp, label, None, false);
++                let aresp = aresp.on_hover_text(crate::i18n::t(label));
++                let menu = |ui: &mut egui::Ui| if cmd == "osnap" { osnap_menu(ui, &s) } else { snap_menu(ui, &s) };
++                let picked = egui::Popup::menu(&aresp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(menu).and_then(|r| r.inner);
++                let picked = picked.or_else(|| {
++                    egui::Popup::context_menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(menu).and_then(|r| r.inner)
++                });
++                if picked.is_some() {
++                    status_menu = picked;
++                }
++                rx += MENU_ARROW;
++            }
++        }
++        match status_menu {
++            Some(StatusMenu::Osmode(n)) => {
++                let _ = app.session.execute("osnap", &json!({ "osmode": n }));
++            }
++            Some(StatusMenu::SnapType(polar)) => {
++                let _ = app.session.execute("setvar", &json!({ "name": "SNAPTYPE", "value": i32::from(polar) }));
++                let _ = app.session.execute("snap", &json!({ "on": true }));
++            }
++            Some(StatusMenu::Settings) => toggle_cmd = Some("ui.dialog.dsettings"),
++            None => {}
+         }
+         // The toggles don't cancel the active command (#1108); the dialog buttons start theirs.
+         match toggle_cmd {
+@@ -518,6 +556,61 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
+     });
+ }
+ 
++/// Width of the menu arrow beside a status bar toggle that has one.
++const MENU_ARROW: f32 = 10.0;
++
++/// Whether the status bar toggle running `cmd` has a menu (arrow and right-click).
++fn has_menu(cmd: &str) -> bool {
++    matches!(cmd, "osnap" | "snap")
++}
++
++/// What was chosen in a status bar toggle's menu.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum StatusMenu {
++    /// The new OSMODE.
++    Osmode(u32),
++    /// SNAPTYPE: PolarSnap (true) or Grid Snap.
++    SnapType(bool),
++    /// Drafting Settings.
++    Settings,
++}
++
++/// The Object Snap menu: every running snap with a check mark, then the settings. Checking a
++/// snap also turns Object Snap on, as AutoCAD does; the menu stays open to pick several.
++fn osnap_menu(ui: &mut egui::Ui, s: &cadcraft_engine::Settings) -> Option<StatusMenu> {
++    use cadcraft_engine::snap::mode;
++    let mut picked = None;
++    for (bit, name) in mode::ALL {
++        let mut checked = s.osmode & bit != 0;
++        if ui.checkbox(&mut checked, crate::i18n::t(name)).clicked() {
++            picked = Some(StatusMenu::Osmode(if checked { (s.osmode | bit) & !mode::OFF } else { s.osmode & !bit }));
++        }
++    }
++    ui.separator();
++    if ui.button(crate::tl!("Object Snap Settings...")).clicked() {
++        picked = Some(StatusMenu::Settings);
++        ui.close();
++    }
++    picked
++}
++
++/// The Snap Mode menu: PolarSnap or Grid Snap (either turns Snap on), then the settings.
++fn snap_menu(ui: &mut egui::Ui, s: &cadcraft_engine::Settings) -> Option<StatusMenu> {
++    let mut picked = None;
++    for (polar, label) in [(true, "PolarSnap"), (false, "Grid snap")] {
++        if ui.radio(s.snapmode && s.polarsnap == polar, crate::i18n::t(label)).clicked() {
++            picked = Some(StatusMenu::SnapType(polar));
++            ui.close();
++        }
++    }
++    ui.separator();
++    if ui.button(crate::tl!("Snap Settings...")).clicked() {
++        picked = Some(StatusMenu::Settings);
++        ui.close();
++    }
++    picked
++}
++
+ /// The Start page (no drawing open, or the Start tab).
+ pub fn start_page(app: &mut CadApp, ui: &mut egui::Ui) {
+     let t = Tokens::get();
+diff --git a/crates/ui-egui/src/i18n/it.tsv b/crates/ui-egui/src/i18n/it.tsv
+index c7a0941..649fe93 100644
+--- a/crates/ui-egui/src/i18n/it.tsv
++++ b/crates/ui-egui/src/i18n/it.tsv
+@@ -1259,3 +1259,7 @@ menu	Modify	Edita
+ 	Discard	Scarta
+ 	Customize	Personalizza
+ 	Edit Command Aliases (PGP)...	Modifica alias dei comandi (PGP)...
++	Object Snap menu	Menu snap ad oggetto
++	Snap Mode menu	Menu modalità snap
++	Object Snap Settings...	Impostazioni snap ad oggetto...
++	Snap Settings...	Impostazioni snap...
+diff --git a/crates/ui-egui/src/i18n/uk.tsv b/crates/ui-egui/src/i18n/uk.tsv
+index 8987b07..e1faf9e 100644
+--- a/crates/ui-egui/src/i18n/uk.tsv
++++ b/crates/ui-egui/src/i18n/uk.tsv
+@@ -1358,3 +1358,7 @@
+ 	Discard	Скасувати зміни
+ 	Customize	Налаштування інтерфейсу
+ 	Edit Command Aliases (PGP)...	Редагувати псевдоніми команд (PGP)...
++	Object Snap menu	Меню об'єктної прив'язки
++	Snap Mode menu	Меню режиму прив'язки
++	Object Snap Settings...	Параметри об'єктної прив'язки...
++	Snap Settings...	Параметри прив'язки...
+diff --git a/crates/ui-egui/tests/status_bar_osnap_menu.rs b/crates/ui-egui/tests/status_bar_osnap_menu.rs
+new file mode 100644
+index 0000000..9295288
+--- /dev/null
++++ b/crates/ui-egui/tests/status_bar_osnap_menu.rs
+@@ -0,0 +1,153 @@
++//! The Object Snap and Snap Mode buttons on the status bar have AutoCAD's menu: the arrow beside
++//! the button, or a right-click on it, lists the running snaps to check and the settings; a snap
++//! checked there then finds the geometry of the other objects under the cursor.
++
++use cadcraft_engine::Session;
++use cadcraft_engine::doc::{Common, Drawing, EntityKind, Line, Space};
++use cadcraft_engine::geom::Vec2;
++use cadcraft_engine::snap::mode;
++use cadcraft_ui_egui::{CadApp, Services};
++use egui::{Event, Modifiers, PointerButton, Pos2, vec2};
++use egui_kittest::Harness;
++use egui_kittest::kittest::Queryable;
++use serde_json::json;
++
++fn harness() -> Harness<'static, CadApp> {
++    let mut d = Drawing::new_imperial();
++    for (a, b) in [(Vec2::new(0.0, 0.0), Vec2::new(20.0, 0.0)), (Vec2::new(0.0, 10.0), Vec2::new(20.0, 10.0))] {
++        d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: a.to3(0.0), b: b.to3(0.0) })).unwrap();
++    }
++    let mut session = Session::empty();
++    session.open_drawing(d, "Status bar osnap menu", None);
++    session.execute("view.set", &json!({"center":[10,5],"height":30})).unwrap();
++    let mut app = CadApp::new(session, Services::default());
++    app.canvas.zoom_pending = false;
++    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
++        |ui, app: &mut CadApp| {
++            app.logic(ui.ctx());
++            app.ui(ui);
++        },
++        app,
++    );
++    h.run_steps(5);
++    h
++}
++
++/// Click the menu's check box for a snap (the canvas's own menus may hold the same label).
++fn check(h: &Harness<'_, CadApp>, name: &str) {
++    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, name).click();
++}
++
++fn osmode(h: &Harness<'_, CadApp>) -> u32 {
++    h.state().session.settings.osmode
++}
++
++fn hover(h: &mut Harness<'_, CadApp>, point: Vec2) -> Pos2 {
++    let pos = h.state().canvas.xf.unwrap().to_screen(point) + vec2(3.0, 2.0);
++    h.event(Event::PointerMoved(pos));
++    h.run_steps(3);
++    pos
++}
++
++fn click(h: &mut Harness<'_, CadApp>, pos: Pos2) {
++    for pressed in [true, false] {
++        h.event(Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
++        h.run_steps(2);
++    }
++}
++
++#[test]
++fn the_arrow_menu_checks_snaps_that_then_find_other_objects() {
++    let mut h = harness();
++    // AutoCAD's default running snaps: Endpoint, Center, Intersection, Extension; no Midpoint.
++    assert_eq!(osmode(&h), mode::END | mode::CEN | mode::INT | mode::EXT);
++    h.get_by_label("Object Snap menu").click();
++    h.run_steps(2);
++    check(&h, "Midpoint");
++    h.run_steps(2);
++    // The menu stays open, so a second snap can be checked straight away.
++    check(&h, "Perpendicular");
++    h.run_steps(2);
++    assert_eq!(osmode(&h), mode::END | mode::CEN | mode::INT | mode::EXT | mode::MID | mode::PER);
++    h.key_press(egui::Key::Escape);
++    h.run_steps(2);
++
++    // LINE from the midpoint of the lower line, perpendicular to the upper one.
++    h.state_mut().start("line");
++    h.run_steps(2);
++    let pos = hover(&mut h, Vec2::new(10.0, 0.0));
++    let hit = h.state().canvas.snap.expect("midpoint marker");
++    assert_eq!(hit.mode, mode::MID);
++    assert!(hit.point.near(Vec2::new(10.0, 0.0), 1e-6));
++    click(&mut h, pos);
++    let pos = hover(&mut h, Vec2::new(10.4, 10.0));
++    let hit = h.state().canvas.snap.expect("perpendicular marker");
++    assert_eq!(hit.mode, mode::PER);
++    assert!(hit.point.near(Vec2::new(10.0, 10.0), 1e-6));
++    click(&mut h, pos);
++    let st = h.state().session.state().unwrap();
++    let line = st.doc.space(&Space::Model).unwrap().iter().find_map(|e| match &e.kind {
++        EntityKind::Line(l) if l.a.xy().near(Vec2::new(10.0, 0.0), 1e-6) => Some((l.a.xy(), l.b.xy())),
++        _ => None,
++    });
++    let (_, b) = line.expect("the new line starts at the midpoint");
++    assert!(b.near(Vec2::new(10.0, 10.0), 1e-6), "{b:?}");
++}
++
++#[test]
++fn a_right_click_on_the_button_opens_the_same_menu_and_unchecks() {
++    let mut h = harness();
++    h.get_by_label("Object Snap (F3)").click_secondary();
++    h.run_steps(2);
++    check(&h, "Endpoint");
++    h.run_steps(2);
++    assert_eq!(osmode(&h) & mode::END, 0);
++    assert_ne!(osmode(&h) & mode::CEN, 0);
++}
++
++#[test]
++fn checking_a_snap_while_object_snap_is_off_turns_it_on() {
++    let mut h = harness();
++    h.state_mut().session.settings.osmode |= mode::OFF;
++    h.run_steps(2);
++    h.get_by_label("Object Snap menu").click();
++    h.run_steps(2);
++    check(&h, "Nearest");
++    h.run_steps(2);
++    assert_eq!(osmode(&h) & mode::OFF, 0);
++    assert_ne!(osmode(&h) & mode::NEA, 0);
++}
++
++#[test]
++fn the_settings_item_and_a_button_with_no_snaps_open_drafting_settings() {
++    let mut h = harness();
++    h.get_by_label("Object Snap menu").click();
++    h.run_steps(2);
++    h.get_by_label("Object Snap Settings...").click();
++    h.run_steps(3);
++    assert_eq!(h.state().ui.dialog.as_deref(), Some("dsettings"));
++    h.state_mut().ui.dialog = None;
++    h.state_mut().session.settings.osmode = 0;
++    h.run_steps(2);
++    h.get_by_label("Object Snap (F3)").click();
++    h.run_steps(3);
++    assert_eq!(h.state().ui.dialog.as_deref(), Some("dsettings"));
++}
++
++#[test]
++fn the_snap_mode_menu_picks_polar_or_grid_snap_and_turns_snap_on() {
++    let mut h = harness();
++    assert!(!h.state().session.settings.snapmode);
++    h.get_by_label("Snap Mode menu").click();
++    h.run_steps(2);
++    h.get_by_label("PolarSnap").click();
++    h.run_steps(2);
++    assert!(h.state().session.settings.snapmode);
++    assert!(h.state().session.settings.polarsnap);
++    h.get_by_label("Snap Mode menu").click();
++    h.run_steps(2);
++    h.get_by_label("Grid snap").click();
++    h.run_steps(2);
++    assert!(h.state().session.settings.snapmode);
++    assert!(!h.state().session.settings.polarsnap);
++}
